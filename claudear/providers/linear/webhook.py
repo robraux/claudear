@@ -113,8 +113,11 @@ class LinearWebhookEventSource(EventSource):
                         f"not {self._instance.instance_id}"
                     )
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(
+                    f"Failed to resolve team UUID for {self._instance.instance_id}: {e}"
+                )
+                return
 
         # --- Intake filter (state-change events only) ---
         is_state_change = payload.action == "update" and payload.is_state_change()

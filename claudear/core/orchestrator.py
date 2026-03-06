@@ -115,6 +115,21 @@ class TaskOrchestrator:
         self._lock: Optional[asyncio.Lock] = None
         self._comment_poll_task: Optional[asyncio.Task] = None
 
+    @staticmethod
+    def _log_task_exception(task: asyncio.Task) -> None:
+        """Log unhandled exceptions from fire-and-forget asyncio tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error(f"Unhandled exception in background task: {exc}", exc_info=exc)
+
+    def _create_tracked_task(self, coro) -> asyncio.Task:
+        """Create an asyncio task with exception logging."""
+        task = asyncio.create_task(coro)
+        task.add_done_callback(self._log_task_exception)
+        return task
+
     def _get_lock(self) -> asyncio.Lock:
         """Get or create the async lock."""
         if self._lock is None:
@@ -188,7 +203,7 @@ class TaskOrchestrator:
         await self._recover_tasks()
 
         # Start comment polling for blocked tasks
-        self._comment_poll_task = asyncio.create_task(self._poll_comments())
+        self._comment_poll_task = self._create_tracked_task(self._poll_comments())
 
         logger.info("Task orchestrator started")
 
@@ -453,10 +468,10 @@ class TaskOrchestrator:
                 title=title,
                 description=description,
                 command=phase_command,
-                on_blocked=lambda reason: asyncio.create_task(
+                on_blocked=lambda reason: self._create_tracked_task(
                     self._handle_blocked(task_id, reason, repo_key=repo_key, phase=phase)
                 ),
-                on_complete=lambda: asyncio.create_task(
+                on_complete=lambda: self._create_tracked_task(
                     self._handle_phase_task_complete(task_id, repo_key, phase)
                 ),
             )
@@ -472,7 +487,7 @@ class TaskOrchestrator:
                 self._active_tasks[task_key] = active_task
 
             # Run Claude session
-            asyncio.create_task(
+            self._create_tracked_task(
                 self._run_phase_session(task_id, repo_key, phase, runner)
             )
 

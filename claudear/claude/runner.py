@@ -65,6 +65,7 @@ class ClaudeRunner:
         issue_identifier: str,
         title: str,
         description: Optional[str] = None,
+        command: Optional[str] = None,
         on_output: Optional[Callable[[str], None]] = None,
         on_blocked: Optional[Callable[[str], None]] = None,
         on_complete: Optional[Callable[[], None]] = None,
@@ -77,6 +78,9 @@ class ClaudeRunner:
             issue_identifier: Issue identifier (e.g., "ENG-123")
             title: Issue title
             description: Issue description
+            command: Custom command to invoke (e.g., "generate-spec").
+                When set, the prompt is "/<command> <identifier>" instead
+                of the default free-text prompt.
             on_output: Callback for output (streaming)
             on_blocked: Callback when blocked (receives reason)
             on_complete: Callback when task completes
@@ -86,6 +90,7 @@ class ClaudeRunner:
         self.issue_identifier = issue_identifier
         self.title = title
         self.description = description
+        self.command = command
         self.on_output = on_output
         self.on_blocked = on_blocked
         self.on_complete = on_complete
@@ -122,12 +127,16 @@ class ClaudeRunner:
         )
 
         # Build the prompt
-        prompt = build_prompt(
-            issue_identifier=self.issue_identifier,
-            title=self.title,
-            description=self.description,
-            additional_context=additional_context,
-        )
+        if self.command:
+            # Phase-based: invoke a custom command
+            prompt = f"/{self.command} {self.issue_identifier}"
+        else:
+            prompt = build_prompt(
+                issue_identifier=self.issue_identifier,
+                title=self.title,
+                description=self.description,
+                additional_context=additional_context,
+            )
 
         try:
             result = await self._execute_claude(prompt, session_id)

@@ -211,6 +211,5 @@ async def webhook_health():
         "status": "healthy",
         "providers": {
             "linear": settings.has_linear(),
-            "notion": settings.has_notion(),
         },
     }

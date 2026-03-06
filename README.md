@@ -1,242 +1,167 @@
 # Claudear
 
-Autonomous development automation with Claude Code, Linear, and Notion.
+Autonomous development automation with Claude Code and Linear.
 
-Move a task to "Todo" in Linear or Notion and Claudear takes over — it creates an isolated git worktree, runs Claude Code to implement the work, posts progress updates, and opens a PR when done. Move to "Done" and the PR auto-merges.
+Claudear watches your Linear board for state changes, creates isolated git worktrees, and invokes Claude Code headless to implement tickets. It supports a two-phase pipeline (spec generation, then implementation) with label-based multi-repo routing.
 
 ## Features
 
-- **Multi-Provider**: Works with Linear (webhooks) and Notion (polling)
-- **Multi-Team/Database**: Support multiple Linear teams or Notion databases simultaneously
-- **Per-Project Repos**: Each team/database can have its own repository
-- **Parallel Execution**: Run multiple Claude Code sessions concurrently
-- **Auto PR Creation**: Pushes code and creates PRs automatically
-- **Auto PR Merge**: Move to "Done" to merge PRs
-- **Progress Updates**: Posts comments as Claude works
+- **Two-Phase Pipeline**: Spec generation ("Ready for Spec") and implementation ("Ready for Dev"), separated by a human review gate
+- **Label-Based Repo Routing**: Tag issues with `repo:api`, `repo:web`, etc. to route work to multiple repositories in parallel
+- **Intake Filtering**: Only processes issues assigned to allowed users with the `claude:auto` label
+- **Fan-Out / Fan-In**: One issue can spawn parallel tasks across repos; the ticket advances only when all repo tasks complete
+- **Automated State Transitions**: Moves tickets through board states via the Linear API
+- **Multi-Team**: Support multiple Linear teams simultaneously
+- **Real-Time Labels**: Shows what Claude is doing (reading, editing, testing) via Linear labels
 
 ## Installation
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/ianborders/claudear.git
-cd claudear
-
-# 2. Install the claudear command
 pip install claudear
-
-# 3. Create your config
-cp .env.example .env
-```
-
-Edit `.env` with your API keys (see [Configuration](#configuration) below).
-
-### Updating
-
-```bash
-pip install -U claudear
 ```
 
 ## Quick Start
 
-Start Claudear from the cloned directory:
-
 ```bash
-cd claudear
+# Create your config
+cp .env.example .env
+# Edit .env with your API keys (see Configuration below)
+
+# Run
 claudear
 ```
 
-> **Important:** Always run `claudear` from the cloned repository directory. Configuration is loaded from `.env` in the current working directory.
+> **Important:** Always run `claudear` from the directory containing your `.env` file.
 
 ## How It Works
 
-1. **Move task to Todo** — Claudear picks it up
-2. **Automatic implementation** — Creates isolated git worktree, runs Claude Code
-3. **Progress updates** — Comments on Linear/Notion as it works
-4. **Blocked?** — Posts a comment asking for help, waits for your reply
-5. **Complete** — Pushes code, creates PR, moves to "In Review"
-6. **Move to "Done"** — PR auto-merges, worktree cleaned up
+1. **Tag issue** with `claude:auto` and `repo:X` labels, assign to yourself
+2. **Move to "Ready for Spec"** - Claudear runs `/<spec-command> <identifier>` in each tagged repo
+3. **Review spec** - Issue moves to "Spec Review" when all repos finish. You review.
+4. **Move to "Ready for Dev"** - Claudear runs `/<impl-command> <identifier>` in each repo
+5. **Review code** - Issue moves to "In Review" when all repos finish
+6. **Blocked?** - If Claude gets stuck, the issue moves to "Blocked" and a comment is posted. Reply to unblock.
 
 ## Prerequisites
 
 - Python 3.9+
 - [Claude Code](https://claude.ai/code) CLI installed and authenticated
-- [ngrok](https://ngrok.com/) account (free tier works) — for Linear webhooks
+- [ngrok](https://ngrok.com/) account (free tier works) for webhook delivery
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
-- Linear workspace with API access, and/or Notion workspace with API access
+- Linear workspace with API access
 
 ## Configuration
 
-### Single Linear Team (Simplest Setup)
+### Environment Variables
 
 ```bash
 # Linear
-LINEAR_API_KEY=lin_api_xxx           # Settings → API → Personal API keys
+LINEAR_API_KEY=lin_api_xxx           # Settings -> API -> Personal API keys
 LINEAR_WEBHOOK_SECRET=whsec_xxx      # Created when you register the webhook
-LINEAR_TEAM_ID=ENG                   # Your team key from URL (linear.app/ENG/...)
+LINEAR_TEAM_IDS=ENG                  # Comma-separated team keys
 
-# Linear workflow states (must match exactly)
-LINEAR_STATE_TODO=Todo
-LINEAR_STATE_IN_PROGRESS=In Progress
-LINEAR_STATE_IN_REVIEW=In Review
-LINEAR_STATE_DONE=Done
+# Intake filter
+ALLOWED_ASSIGNEES=user-uuid-1,user-uuid-2   # Linear user IDs allowed to trigger automation
+
+# Repo routing (JSON: label key -> local path)
+REPO_MAP='{"api": "/path/to/api-repo", "web": "/path/to/web-repo"}'
+
+# Two-phase pipeline states (must match your Linear board exactly)
+PHASE1_TRIGGER_STATE=Ready for Spec
+PHASE1_ACTIVE_STATE=Speccing
+PHASE1_COMPLETE_STATE=Spec Review
+PHASE2_TRIGGER_STATE=Ready for Dev
+PHASE2_ACTIVE_STATE=In Progress
+PHASE2_COMPLETE_STATE=In Review
+BLOCKED_STATE=Blocked
+
+# Phase commands (Claude Code custom commands invoked as /<command> <identifier>)
+PHASE1_COMMAND=generate-spec
+PHASE2_COMMAND=implement-spec
 
 # GitHub
-GITHUB_TOKEN=ghp_xxx                 # Settings → Developer settings → Tokens
-
-# Repository
-REPO_PATH=/path/to/your/repo         # The repo Claudear will work on
+GITHUB_TOKEN=ghp_xxx
 
 # Server & ngrok
 WEBHOOK_PORT=8000
-NGROK_AUTHTOKEN=xxx                  # dashboard.ngrok.com → Your Authtoken
+NGROK_AUTHTOKEN=xxx
+
+# Optional
+LINEAR_LABELS_ENABLED=true           # Real-time activity labels (default: true)
+MAX_CONCURRENT_TASKS=5
+COMMENT_POLL_INTERVAL=30             # Seconds between polls for blocked tasks
+BLOCKED_TIMEOUT=86400                # Seconds before blocked task times out
+LOG_LEVEL=INFO
+DB_PATH=claudear.db
 ```
 
-### Multiple Linear Teams
+### Linear Board Setup
 
-```bash
-LINEAR_API_KEY=lin_api_xxx
-LINEAR_WEBHOOK_SECRET=whsec_xxx
-LINEAR_TEAM_IDS=ENG,INFRA,DESIGN     # Comma-separated team keys
+Your Linear workflow should have these states (names configurable via env vars):
 
-# Per-team repository paths
-LINEAR_ENG_REPO=/path/to/engineering-repo
-LINEAR_INFRA_REPO=/path/to/infrastructure-repo
-LINEAR_DESIGN_REPO=/path/to/design-system-repo
+```
+Backlog -> Ready for Spec -> Speccing -> Spec Review -> Ready for Dev -> In Progress -> In Review -> Done
+                                                    \                                            /
+                                                     +-----------> Blocked <--------------------+
 ```
 
-### Single Notion Database
+### Labels
 
-```bash
-NOTION_API_KEY=secret_xxx
-NOTION_DATABASE_ID=abc123def456
-NOTION_POLL_INTERVAL=5               # Seconds between polls
+Create these labels in your Linear workspace:
 
-REPO_PATH=/path/to/your/repo
-GITHUB_TOKEN=ghp_xxx
-```
-
-### Multiple Notion Databases
-
-```bash
-NOTION_API_KEY=secret_xxx
-NOTION_DATABASE_IDS=abc123,def456,ghi789
-
-# Per-database repository paths
-NOTION_abc123_REPO=/path/to/project-alpha-repo
-NOTION_def456_REPO=/path/to/project-beta-repo
-NOTION_ghi789_REPO=/path/to/project-gamma-repo
-```
-
-### Both Linear and Notion
-
-Configure both providers — Claudear auto-detects and runs them simultaneously.
+- `claude:auto` - Required on issues for Claudear to pick them up
+- `repo:api`, `repo:web`, etc. - One per repo key in your `REPO_MAP`
 
 ## Setup
 
-### 1. Create a static ngrok domain (for Linear)
-
-You need a persistent URL so the Linear webhook survives restarts.
+### 1. Create a static ngrok domain
 
 1. Go to [ngrok Domains](https://dashboard.ngrok.com/cloud-edge/domains)
 2. Create a free static domain (e.g., `your-name.ngrok-free.app`)
-3. Create `~/Library/Application Support/ngrok/ngrok.yml`:
-
-```yaml
-authtoken: your_auth_token
-tunnels:
-  claudear:
-    addr: 8000
-    proto: http
-    domain: your-name.ngrok-free.app
-```
 
 ### 2. Disable Linear's GitHub automations
 
 Linear has built-in automations that conflict with Claudear. **You must disable them:**
 
-1. Linear → Settings → Team Settings → Workflow → **GitHub**
-2. Set all "Automate state changes" options to **No action**
-   - "When a branch is created" → No action
-   - "When a PR is opened" → No action
-   - "When a PR is merged" → No action
-   - etc.
-
-If you skip this, Linear will fight Claudear for control of issue states.
+1. Linear -> Settings -> Team Settings -> Workflow -> **GitHub**
+2. Set all "Automate state changes" to **No action**
 
 ### 3. Register Linear webhook
 
-1. Linear → Settings → API → Webhooks → **Create webhook**
-2. Configure:
-   - **URL**: `https://your-name.ngrok-free.app/webhooks/linear`
-   - **Events**: Issues, Comments
-3. Copy the **signing secret** to `.env` as `LINEAR_WEBHOOK_SECRET`
+1. Linear -> Settings -> API -> Webhooks -> **Create webhook**
+2. URL: `https://your-name.ngrok-free.app/webhooks/linear`
+3. Events: Issues, Comments
+4. Copy the signing secret to `LINEAR_WEBHOOK_SECRET`
 
-### 4. Set up Notion integration (if using Notion)
-
-1. Go to [Notion Integrations](https://www.notion.so/my-integrations)
-2. Create a new integration with read/write access
-3. Copy the **Internal Integration Token** to `.env` as `NOTION_API_KEY`
-4. Share your database with the integration (click "..." → Add connections)
-
-### 5. Run
+### 4. Run
 
 ```bash
 claudear
 ```
 
-Claudear starts the webhook server, connects ngrok (for Linear), and begins polling (for Notion).
-
-## Usage
-
-| Action | Result |
-|--------|--------|
-| Move task → **Todo** | Claudear starts working |
-| Claude gets stuck | Posts comment, waits for your reply |
-| Reply to comment | Claudear resumes |
-| Task complete | PR created, task → "In Review" |
-| Move task → **Done** | PR merges, worktree cleaned up |
-
 ## Troubleshooting
 
-**Webhook not receiving events (Linear)**
+**Webhook not receiving events**
 - Verify webhook URL matches your ngrok domain
 - Check signing secret matches `LINEAR_WEBHOOK_SECRET`
 - Test: `curl https://your-domain.ngrok-free.app/health`
 
-**Notion tasks not picked up**
-- Verify database is shared with your integration
-- Check `NOTION_DATABASE_ID` matches the ID in the URL
-- Increase `NOTION_POLL_INTERVAL` if rate limited
+**Issues not picked up**
+- Verify the issue has the `claude:auto` label
+- Verify the assignee's user ID is in `ALLOWED_ASSIGNEES`
+- Verify at least one `repo:X` label matches a key in `REPO_MAP`
 
 **Claude not starting**
 - Run `claude` manually to verify CLI is installed and authenticated
-- Check `REPO_PATH` (or per-team/database paths) exists and is a git repository
+- Check that all paths in `REPO_MAP` exist and are git repositories
 
 **Tasks stuck in "Blocked"**
-- Check Linear/Notion for Claude's comment asking for help
-- Reply to unblock (polls every 30 seconds)
-
-**Port 8000 in use**
-- Kill existing processes: `lsof -ti:8000 | xargs kill -9`
-- Kill ngrok: `pkill ngrok`
-
-**Test the multi-provider setup**
-```bash
-python -m claudear.scripts.test_multi_provider
-```
-
-## Migration from Single-Provider
-
-If you're upgrading from an earlier version with existing task data:
-
-```bash
-python -m claudear.scripts.migrate_db --dry-run     # Preview changes
-python -m claudear.scripts.migrate_db               # Apply migration
-```
+- Check Linear for Claude's comment asking for help
+- Reply to unblock (polls every 30 seconds by default)
 
 ## How It Uses Claude Code
 
-Claudear runs Claude Code CLI in headless mode using your **Claude Code subscription** (not API credits). It's the same Claude you use interactively, just automated.
+Claudear runs Claude Code CLI in headless mode using your **Claude Code subscription** (not API credits). It invokes custom commands (`/<command> <identifier>`) in isolated git worktrees.
 
 ## License
 

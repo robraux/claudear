@@ -38,8 +38,8 @@ class TaskStatusChangedEvent(Event):
     """Event when a task status changes.
 
     This is the primary trigger for task automation:
-    - Task moved to "Todo" -> Start working
-    - Task moved to "Done" -> Merge PR and cleanup
+    - Task moved to "Ready for Spec" -> Start Phase 1
+    - Task moved to "Ready for Dev" -> Start Phase 2
     """
 
     type: EventType = field(default=EventType.TASK_STATUS_CHANGED, init=False)
@@ -51,6 +51,16 @@ class TaskStatusChangedEvent(Event):
     # Task content (for starting new tasks)
     task_title: str = ""
     task_description: Optional[str] = None
+
+    # Phase and routing info (populated by webhook handler)
+    phase: Optional[str] = None  # "spec" or "implement", None if not a phase trigger
+    phase_command: Optional[str] = None  # Claude command to invoke
+    repo_keys: list[str] = field(default_factory=list)  # Target repos
+    new_state_name: Optional[str] = None  # Exact Linear state name
+
+    def is_phase_trigger(self) -> bool:
+        """Check if this event triggers a pipeline phase."""
+        return self.phase is not None
 
     def is_transition_to_todo(self) -> bool:
         """Check if this is a transition to TODO status."""

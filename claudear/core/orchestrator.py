@@ -29,6 +29,9 @@ from claudear.git.worktree import WorktreeManager
 from claudear.git.github import GitHubClient
 
 if TYPE_CHECKING:
+    from claudear.core.config import MultiProviderSettings
+
+if TYPE_CHECKING:
     from claudear.claude.runner import ClaudeRunner, ClaudeRunnerPool
 
 logger = logging.getLogger(__name__)
@@ -71,6 +74,8 @@ class TaskOrchestrator:
         max_concurrent_tasks: int = 3,
         comment_poll_interval: int = 30,
         blocked_timeout: int = 86400,  # 24 hours
+        repo_map: Optional[dict[str, Path]] = None,
+        phase_config: Optional[dict[str, dict[str, str]]] = None,
     ):
         """Initialize the orchestrator.
 
@@ -80,12 +85,16 @@ class TaskOrchestrator:
             max_concurrent_tasks: Maximum concurrent tasks across all instances
             comment_poll_interval: Seconds between comment polls for blocked tasks
             blocked_timeout: Seconds before a blocked task times out
+            repo_map: Mapping of repo keys to local paths
+            phase_config: Phase trigger config (state_name -> {phase, command, active_state, complete_state})
         """
         self.store = task_store
         self._github_token = github_token
         self._max_concurrent_tasks = max_concurrent_tasks
         self._comment_poll_interval = comment_poll_interval
         self._blocked_timeout = blocked_timeout
+        self._repo_map: dict[str, Path] = repo_map or {}
+        self._phase_config: dict[str, dict[str, str]] = phase_config or {}
 
         # Providers: provider_type -> PMProvider
         self._providers: dict[ProviderType, PMProvider] = {}
@@ -93,8 +102,11 @@ class TaskOrchestrator:
         # Instance resources: (provider_type, instance_id) -> InstanceResources
         self._instance_resources: dict[tuple[ProviderType, str], InstanceResources] = {}
 
-        # Active tasks: composite_key -> ActiveTask
+        # Active tasks: task_key -> ActiveTask
         self._active_tasks: dict[str, ActiveTask] = {}
+
+        # Per-issue locks for fan-in coordination
+        self._issue_locks: dict[str, asyncio.Lock] = {}
 
         # Claude runner pool (shared across all instances)
         self._runner_pool: Optional["ClaudeRunnerPool"] = None
@@ -254,114 +266,152 @@ class TaskOrchestrator:
             logger.error(f"Error handling event: {e}")
 
     async def _handle_status_change(self, event: TaskStatusChangedEvent) -> None:
-        """Handle a task status change event.
-
-        Args:
-            event: Status change event
-        """
+        """Handle a task status change event."""
         task_id = event.task_id
 
         logger.info(
             f"Status change: {task_id.identifier} "
             f"{event.old_status.value if event.old_status else 'unknown'} -> "
             f"{event.new_status.value}"
+            f"{f' (phase: {event.phase})' if event.phase else ''}"
         )
 
-        # Handle based on new status
-        if event.new_status == TaskStatus.TODO:
-            await self._start_task(task_id, event.task_title, event.task_description)
+        if event.is_phase_trigger():
+            await self._start_phase(
+                task_id=task_id,
+                phase=event.phase,
+                phase_command=event.phase_command,
+                repo_keys=event.repo_keys,
+                title=event.task_title,
+                description=event.task_description,
+            )
         elif event.new_status == TaskStatus.DONE:
             await self._handle_done(task_id)
+        else:
+            logger.debug(
+                f"Ignoring non-phase status change for {task_id.identifier}: "
+                f"{event.new_status.value}"
+            )
 
     async def _handle_comment(self, event: TaskCommentAddedEvent) -> None:
-        """Handle a new comment event.
-
-        Args:
-            event: Comment event
-        """
+        """Handle a new comment event."""
         if event.is_bot_comment:
             return
 
         task_id = event.task_id
-        composite_key = task_id.composite_key
 
+        # Find any blocked tasks for this issue
         async with self._get_lock():
-            active_task = self._active_tasks.get(composite_key)
-            if not active_task or active_task.context.state != TaskState.BLOCKED:
-                return
+            blocked_keys = [
+                key for key, at in self._active_tasks.items()
+                if at.task_id == task_id and at.context.state == TaskState.BLOCKED
+            ]
 
-        logger.info(f"Human comment on blocked task {task_id.identifier}")
-        await self._handle_unblock(task_id, event.comment_body)
+        if not blocked_keys:
+            return
+
+        logger.info(
+            f"Human comment on blocked task {task_id.identifier}, "
+            f"unblocking {len(blocked_keys)} task(s)"
+        )
+        for task_key in blocked_keys:
+            await self._handle_unblock(task_id, event.comment_body, task_key=task_key)
+
+    def _get_issue_lock(self, issue_id: str) -> asyncio.Lock:
+        """Get or create a per-issue lock for fan-in coordination."""
+        if issue_id not in self._issue_locks:
+            self._issue_locks[issue_id] = asyncio.Lock()
+        return self._issue_locks[issue_id]
 
     # -------------------------------------------------------------------------
-    # Task Lifecycle
+    # Phase-Based Task Lifecycle
     # -------------------------------------------------------------------------
 
-    async def _start_task(
+    async def _start_phase(
         self,
         task_id: TaskId,
+        phase: str,
+        phase_command: str,
+        repo_keys: list[str],
         title: str,
         description: Optional[str],
     ) -> None:
-        """Start working on a task.
+        """Start a pipeline phase, fanning out to multiple repos.
 
-        Args:
-            task_id: Task identifier
-            title: Task title
-            description: Task description
+        Creates one task per repo_key, each with its own worktree and
+        Claude session.
         """
-        composite_key = task_id.composite_key
-
-        # Check if already active or completed
-        existing = await self.store.get(
-            task_id.provider, task_id.instance_id, task_id.external_id
-        )
-        if existing and existing.state in (
-            TaskState.COMPLETED,
-            TaskState.IN_REVIEW,
-            TaskState.DONE,
-        ):
-            logger.warning(
-                f"Task {task_id.identifier} already in state {existing.state.value}"
-            )
+        if not repo_keys:
+            logger.warning(f"No repo keys for {task_id.identifier}, skipping phase {phase}")
+            provider = self._get_provider(task_id)
+            if provider:
+                await provider.post_comment(
+                    task_id,
+                    f"**Claudear**: No `repo:X` labels found on this issue. "
+                    f"Add repo labels and move back to trigger state to retry.",
+                )
             return
 
-        async with self._get_lock():
-            if composite_key in self._active_tasks:
-                logger.warning(f"Task {task_id.identifier} already active")
-                return
+        # Determine the active state for this phase
+        active_state = None
+        for state_name, config in self._phase_config.items():
+            if config.get("phase") == phase:
+                active_state = config.get("active_state")
+                break
 
-            # Check concurrency limit
-            if len(self._active_tasks) >= self._max_concurrent_tasks:
-                logger.warning(f"Max concurrent tasks reached, queueing {task_id.identifier}")
-                provider = self._get_provider(task_id)
-                if provider:
-                    await provider.post_comment(
-                        task_id,
-                        f"🤖 **Claudear**: Task queued - maximum concurrent tasks "
-                        f"({self._max_concurrent_tasks}) reached. "
-                        "Will start automatically when a slot opens.",
-                    )
-                return
-
-        logger.info(f"Starting task: {task_id.identifier} - {title}")
-
-        resources = self._get_resources(task_id)
+        # Move issue to active state
         provider = self._get_provider(task_id)
+        if provider and active_state:
+            from claudear.providers.linear.provider import LinearProvider
+            if isinstance(provider, LinearProvider):
+                await provider.update_task_status_by_name(task_id, active_state)
 
-        if not resources or not provider:
-            logger.error(f"No resources/provider for {task_id.composite_key}")
-            return
+        logger.info(
+            f"Starting phase '{phase}' for {task_id.identifier} "
+            f"across repos: {repo_keys}"
+        )
+
+        # Fan out: create a task for each repo
+        for repo_key in repo_keys:
+            repo_path = self._repo_map.get(repo_key)
+            if not repo_path:
+                logger.error(f"Repo key '{repo_key}' not found in REPO_MAP")
+                continue
+
+            await self._start_repo_task(
+                task_id=task_id,
+                phase=phase,
+                phase_command=phase_command,
+                repo_key=repo_key,
+                repo_path=repo_path,
+                title=title,
+                description=description,
+            )
+
+    async def _start_repo_task(
+        self,
+        task_id: TaskId,
+        phase: str,
+        phase_command: str,
+        repo_key: str,
+        repo_path: Path,
+        title: str,
+        description: Optional[str],
+    ) -> None:
+        """Start a single repo task within a phase."""
+        branch_name = f"{task_id.identifier.lower()}/{repo_key}/{phase}"
+
+        # Create worktree manager for this repo
+        worktree_mgr = WorktreeManager(str(repo_path))
+        github_client = GitHubClient(self._github_token)
 
         try:
-            # 1. Update status to In Progress
-            await provider.update_task_status(task_id, TaskStatus.IN_PROGRESS)
+            worktree_id = f"{task_id.identifier}-{repo_key}-{phase}"
+            worktree_path = await worktree_mgr.create(
+                worktree_id, branch_name=branch_name
+            )
 
-            # 2. Create worktree
-            branch_name = resources.worktree_manager.get_branch_name(task_id.identifier)
-            worktree_path = await resources.worktree_manager.create(task_id.identifier)
-
-            # 3. Create task context
+            # Create task context
             context = TaskContext(
                 task_id=task_id,
                 title=title,
@@ -371,46 +421,47 @@ class TaskOrchestrator:
             )
             context.state_machine.start()
 
-            # 4. Save to store
-            await self._save_task(task_id, context)
-
-            # 5. Post status comment
-            await provider.post_comment(
-                task_id,
-                f"🤖 **Claudear**: Starting work on this issue.\n\n"
-                f"- Branch: `{branch_name}`\n"
-                f"- Status: In Progress",
+            # Save task record
+            record = TaskRecord(
+                provider=task_id.provider,
+                instance_id=task_id.instance_id,
+                external_id=task_id.external_id,
+                task_identifier=task_id.identifier,
+                repo_key=repo_key,
+                phase=phase,
+                title=title,
+                description=description,
+                branch_name=branch_name,
+                worktree_path=str(worktree_path),
+                state=TaskState.IN_PROGRESS,
+                blocked_reason=None,
+                blocked_at=None,
+                pr_number=None,
+                pr_url=None,
+                session_id=None,
+                created_at=datetime.now(),
+                updated_at=datetime.now(),
             )
+            await self.store.save(record)
 
-            # 6. Set working indicator
-            await provider.set_working_indicator(task_id, "🚀 Starting...")
-
-            # 7. Create runner and start
+            # Create runner with custom command
             from claudear.claude.runner import ClaudeRunner
-            from claudear.claude.activity import get_activity_for_tool
-
-            # Create tool use callback for real-time status updates
-            def on_tool_use_callback(tool_name: str) -> None:
-                activity = get_activity_for_tool(tool_name)
-                if activity and provider:
-                    asyncio.create_task(
-                        provider.set_working_indicator(task_id, activity.display_text)
-                    )
 
             runner = ClaudeRunner(
                 working_dir=worktree_path,
                 issue_identifier=task_id.identifier,
                 title=title,
                 description=description,
+                command=phase_command,
                 on_blocked=lambda reason: asyncio.create_task(
-                    self._handle_blocked(task_id, reason)
+                    self._handle_blocked(task_id, reason, repo_key=repo_key, phase=phase)
                 ),
                 on_complete=lambda: asyncio.create_task(
-                    self._handle_complete(task_id)
+                    self._handle_phase_task_complete(task_id, repo_key, phase)
                 ),
-                on_tool_use=on_tool_use_callback,
             )
 
+            task_key = record.task_key
             active_task = ActiveTask(
                 context=context,
                 task_id=task_id,
@@ -418,342 +469,265 @@ class TaskOrchestrator:
             )
 
             async with self._get_lock():
-                self._active_tasks[composite_key] = active_task
+                self._active_tasks[task_key] = active_task
 
-            # 8. Run Claude (non-blocking)
-            asyncio.create_task(self._run_claude_session(task_id, runner))
+            # Run Claude session
+            asyncio.create_task(
+                self._run_phase_session(task_id, repo_key, phase, runner)
+            )
+
+            logger.info(
+                f"Started {phase} task for {task_id.identifier}/{repo_key} "
+                f"on branch {branch_name}"
+            )
 
         except Exception as e:
-            logger.error(f"Failed to start task {task_id.identifier}: {e}")
-            if provider:
-                await provider.post_comment(
-                    task_id,
-                    f"🤖 **Claudear**: Failed to start task.\n\nError: {e}",
-                )
+            logger.error(
+                f"Failed to start {phase} task for "
+                f"{task_id.identifier}/{repo_key}: {e}"
+            )
 
-    async def _run_claude_session(
-        self, task_id: TaskId, runner: "ClaudeRunner"
+    async def _run_phase_session(
+        self,
+        task_id: TaskId,
+        repo_key: str,
+        phase: str,
+        runner: "ClaudeRunner",
     ) -> None:
-        """Run a Claude session for a task.
-
-        Args:
-            task_id: Task identifier
-            runner: Claude runner
-        """
+        """Run a Claude session for a phase task."""
+        task_key = f"{task_id.composite_key}:{repo_key}:{phase}"
         try:
             result = await runner.run()
 
             if result.session_id:
-                await self.store.update_session_id(
-                    task_id.provider,
-                    task_id.instance_id,
-                    task_id.external_id,
-                    result.session_id,
-                )
+                await self.store.update_session_id(task_key, result.session_id)
 
             if result.is_blocked:
-                await self._handle_blocked(task_id, result.blocked_reason)
+                await self._handle_blocked(
+                    task_id, result.blocked_reason,
+                    repo_key=repo_key, phase=phase,
+                )
             elif result.is_complete:
-                await self._handle_complete(task_id)
+                await self._handle_phase_task_complete(task_id, repo_key, phase)
             elif result.error:
-                await self._handle_error(task_id, result.error)
+                await self._handle_error(task_id, result.error, repo_key=repo_key, phase=phase)
             else:
-                logger.warning(f"Session for {task_id.identifier} ended without clear state")
+                logger.warning(
+                    f"Session for {task_id.identifier}/{repo_key}/{phase} "
+                    f"ended without clear state"
+                )
 
         except Exception as e:
-            logger.error(f"Claude session failed: {e}")
-            await self._handle_error(task_id, str(e))
+            logger.error(f"Phase session failed: {e}")
+            await self._handle_error(task_id, str(e), repo_key=repo_key, phase=phase)
 
-    async def _handle_blocked(
-        self, task_id: TaskId, reason: Optional[str]
+    async def _handle_phase_task_complete(
+        self,
+        task_id: TaskId,
+        repo_key: str,
+        phase: str,
     ) -> None:
-        """Handle a blocked task.
+        """Handle completion of a single repo task within a phase.
 
-        Args:
-            task_id: Task identifier
-            reason: Reason for blocking
+        Updates the task state, then checks fan-in to see if all repo
+        tasks for this phase are done.
         """
-        composite_key = task_id.composite_key
-        logger.info(f"Task {task_id.identifier} blocked: {reason}")
+        task_key = f"{task_id.composite_key}:{repo_key}:{phase}"
+        logger.info(f"Phase task completed: {task_id.identifier}/{repo_key}/{phase}")
+
+        # Update this task's state
+        await self.store.update_state(task_key, TaskState.COMPLETED)
 
         async with self._get_lock():
-            active_task = self._active_tasks.get(composite_key)
+            if task_key in self._active_tasks:
+                del self._active_tasks[task_key]
+
+        # Fan-in check
+        await self._check_phase_complete(task_id, phase)
+
+    async def _check_phase_complete(
+        self,
+        task_id: TaskId,
+        phase: str,
+    ) -> None:
+        """Fan-in: check if all repo tasks for a phase are done.
+
+        If all complete, transition the Linear issue to the next state.
+        Uses a per-issue lock to prevent duplicate transitions.
+        """
+        async with self._get_issue_lock(task_id.external_id):
+            all_done, blocked_reason = await self.store.check_phase_complete(
+                task_id.external_id, phase
+            )
+
+            if blocked_reason:
+                logger.info(
+                    f"Phase {phase} for {task_id.identifier} has blocked tasks: "
+                    f"{blocked_reason}"
+                )
+                return
+
+            if not all_done:
+                logger.debug(
+                    f"Phase {phase} for {task_id.identifier} not yet complete"
+                )
+                return
+
+            # All tasks done - transition the issue
+            complete_state = None
+            for state_name, config in self._phase_config.items():
+                if config.get("phase") == phase:
+                    complete_state = config.get("complete_state")
+                    break
+
+            if not complete_state:
+                logger.warning(f"No complete_state configured for phase {phase}")
+                return
+
+            provider = self._get_provider(task_id)
+            if provider:
+                from claudear.providers.linear.provider import LinearProvider
+                if isinstance(provider, LinearProvider):
+                    success = await provider.update_task_status_by_name(
+                        task_id, complete_state
+                    )
+                    if success:
+                        logger.info(
+                            f"Phase {phase} complete for {task_id.identifier}, "
+                            f"moved to '{complete_state}'"
+                        )
+                        await provider.post_comment(
+                            task_id,
+                            f"**Claudear**: Phase '{phase}' complete for all repos. "
+                            f"Issue moved to '{complete_state}'.",
+                        )
+
+    async def _handle_blocked(
+        self,
+        task_id: TaskId,
+        reason: Optional[str],
+        repo_key: str = "",
+        phase: str = "",
+    ) -> None:
+        """Handle a blocked task."""
+        task_key = f"{task_id.composite_key}:{repo_key}:{phase}"
+        logger.info(f"Task {task_id.identifier}/{repo_key}/{phase} blocked: {reason}")
+
+        async with self._get_lock():
+            active_task = self._active_tasks.get(task_key)
             if not active_task:
                 return
             active_task.context.state_machine.block(reason or "Unknown reason")
 
-        # Update store
-        await self.store.update_state(
-            task_id.provider,
-            task_id.instance_id,
-            task_id.external_id,
-            TaskState.BLOCKED,
-            reason,
-        )
+        await self.store.update_state(task_key, TaskState.BLOCKED, reason)
 
-        # Update provider indicators
         provider = self._get_provider(task_id)
         if provider:
             await provider.set_blocked_indicator(task_id, reason)
             await provider.post_comment(
                 task_id,
-                f"🤖 **Claudear is blocked**\n\n"
+                f"**Claudear is blocked** (repo: {repo_key})\n\n"
                 f"**Reason**: {reason or 'Unknown'}\n\n"
                 f"Please respond with guidance to continue.",
             )
 
-    async def _handle_unblock(self, task_id: TaskId, comment_body: str) -> None:
-        """Handle unblocking a task via human comment.
+            # Move issue to Blocked state on the board
+            blocked_state = None
+            for _, config in self._phase_config.items():
+                blocked_state = config.get("blocked_state")
+                if blocked_state:
+                    break
+            if blocked_state:
+                from claudear.providers.linear.provider import LinearProvider
+                if isinstance(provider, LinearProvider):
+                    await provider.update_task_status_by_name(task_id, blocked_state)
 
-        Args:
-            task_id: Task identifier
-            comment_body: Human response comment
-        """
-        composite_key = task_id.composite_key
-
+    async def _handle_unblock(
+        self,
+        task_id: TaskId,
+        comment_body: str,
+        task_key: str = "",
+    ) -> None:
+        """Handle unblocking a task via human comment."""
         async with self._get_lock():
-            active_task = self._active_tasks.get(composite_key)
+            active_task = self._active_tasks.get(task_key)
             if not active_task:
                 return
             active_task.context.state_machine.unblock()
 
-        await self.store.update_state(
-            task_id.provider,
-            task_id.instance_id,
-            task_id.external_id,
-            TaskState.IN_PROGRESS,
-        )
+        await self.store.update_state(task_key, TaskState.IN_PROGRESS)
 
         provider = self._get_provider(task_id)
         if provider:
-            await provider.set_working_indicator(task_id, "🔄 Resuming...")
+            await provider.set_working_indicator(task_id, "Resuming...")
 
-        # Resume Claude session
         if active_task.runner:
             result = await active_task.runner.resume(comment_body)
 
             if result.is_blocked:
-                await self._handle_blocked(task_id, result.blocked_reason)
+                # Extract repo_key and phase from task_key
+                parts = task_key.split(":")
+                repo_key = parts[-2] if len(parts) >= 5 else ""
+                phase = parts[-1] if len(parts) >= 5 else ""
+                await self._handle_blocked(
+                    task_id, result.blocked_reason,
+                    repo_key=repo_key, phase=phase,
+                )
             elif result.is_complete:
-                await self._handle_complete(task_id)
-
-    async def _handle_complete(self, task_id: TaskId) -> None:
-        """Handle task completion.
-
-        Args:
-            task_id: Task identifier
-        """
-        composite_key = task_id.composite_key
-        logger.info(f"Task {task_id.identifier} completed")
-
-        async with self._get_lock():
-            active_task = self._active_tasks.get(composite_key)
-            if not active_task:
-                logger.warning(f"No active task found for {task_id.identifier}")
-                return
-
-            if active_task.context.state in (TaskState.COMPLETED, TaskState.IN_REVIEW):
-                logger.warning(f"Task {task_id.identifier} already completed")
-                return
-
-            context = active_task.context
-            context.state_machine.complete()
-
-            # Update store first
-            await self.store.update_state(
-                task_id.provider,
-                task_id.instance_id,
-                task_id.external_id,
-                TaskState.COMPLETED,
-            )
-
-            del self._active_tasks[composite_key]
-
-        resources = self._get_resources(task_id)
-        provider = self._get_provider(task_id)
-
-        if not resources or not provider:
-            return
-
-        try:
-            # 1. Show pushing status
-            await provider.set_working_indicator(task_id, "📤 Pushing to GitHub...")
-
-            # 2. Push to GitHub
-            worktree_path = Path(context.worktree_path)
-            await resources.github_client.push_branch(
-                worktree_path, context.branch_name
-            )
-
-            # 3. Show PR creation status
-            await provider.set_working_indicator(task_id, "📝 Creating PR...")
-
-            # 4. Create PR
-            commit_messages = await resources.github_client.get_commit_messages(
-                worktree_path
-            )
-            pr_body = resources.github_client.format_pr_body(
-                issue_identifier=task_id.identifier,
-                summary=f"Implements {context.title}",
-                changes=commit_messages[:10],
-            )
-            pr_title = resources.github_client.format_pr_title(
-                issue_identifier=task_id.identifier,
-                title=context.title,
-            )
-
-            pr = await resources.github_client.create_pr(
-                worktree_path=worktree_path,
-                title=pr_title,
-                body=pr_body,
-            )
-
-            context.pr_number = pr.number
-            context.pr_url = pr.url
-
-            # 3. Update store with PR info
-            await self.store.update_pr_info(
-                task_id.provider,
-                task_id.instance_id,
-                task_id.external_id,
-                pr.number,
-                pr.url,
-            )
-
-            # 4. Update provider status
-            await provider.update_task_status(task_id, TaskStatus.IN_REVIEW)
-            await provider.set_branch_info(task_id, context.branch_name, pr.url)
-
-            # 5. Post completion comment
-            await provider.post_comment(
-                task_id,
-                f"🤖 **Claudear**: Task completed!\n\n"
-                f"**Pull Request**: [{pr_title}]({pr.url})\n\n"
-                f"Ready for review.",
-            )
-
-            # 6. Show PR ready status
-            await provider.set_working_indicator(task_id, "✅ PR ready for review")
-
-            # 7. Update state to IN_REVIEW
-            context.state_machine.submit_for_review()
-            await self.store.update_state(
-                task_id.provider,
-                task_id.instance_id,
-                task_id.external_id,
-                TaskState.IN_REVIEW,
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to complete task {task_id.identifier}: {e}")
-            await self._handle_error(task_id, str(e))
+                parts = task_key.split(":")
+                repo_key = parts[-2] if len(parts) >= 5 else ""
+                phase = parts[-1] if len(parts) >= 5 else ""
+                await self._handle_phase_task_complete(task_id, repo_key, phase)
 
     async def _handle_done(self, task_id: TaskId) -> None:
-        """Handle task marked as done - merge PR and clean up.
+        """Handle task marked as done externally - clean up all tasks for this issue."""
+        logger.info(f"Issue {task_id.identifier} marked as done")
 
-        Args:
-            task_id: Task identifier
-        """
-        logger.info(f"Task {task_id.identifier} marked as done")
-
-        # Get task record
-        task = await self.store.get(
-            task_id.provider, task_id.instance_id, task_id.external_id
-        )
-        if not task:
-            logger.warning(f"No task record found for {task_id.identifier}")
+        # Get all tasks for this issue
+        tasks = await self.store.get_by_external_id(task_id.provider, task_id.external_id)
+        if not tasks:
+            logger.warning(f"No task records found for {task_id.identifier}")
             return
 
-        composite_key = task_id.composite_key
+        for task in tasks:
+            task_key = task.task_key
 
-        async with self._get_lock():
-            if composite_key in self._active_tasks:
-                active_task = self._active_tasks[composite_key]
-                active_task.context.state_machine.mark_done()
-                del self._active_tasks[composite_key]
+            async with self._get_lock():
+                if task_key in self._active_tasks:
+                    del self._active_tasks[task_key]
 
-        resources = self._get_resources(task_id)
+            await self.store.update_state(task_key, TaskState.DONE)
+
         provider = self._get_provider(task_id)
+        if provider:
+            await provider.clear_indicators(task_id)
 
-        if not resources:
-            return
-
-        # Clean up worktree
-        await resources.worktree_manager.remove(task.task_identifier)
-
-        # Merge PR if exists
-        if task.pr_number:
-            try:
-                # Show merging status
-                if provider:
-                    await provider.set_working_indicator(task_id, "🔀 Merging PR...")
-
-                await resources.github_client.merge_pr(
-                    worktree_path=resources.instance.repo_path,
-                    pr_number=task.pr_number,
-                    merge_method="squash",
-                    delete_branch=True,
-                )
-
-                logger.info(f"Merged PR #{task.pr_number} for {task.task_identifier}")
-
-                if provider:
-                    await provider.post_comment(
-                        task_id,
-                        f"🤖 **Claudear**: PR #{task.pr_number} has been merged! 🎉\n\n"
-                        f"Branch `{task.branch_name}` has been deleted.",
-                    )
-                    # Show merged status instead of clearing
-                    await provider.set_working_indicator(task_id, "✅ Merged")
-
-            except Exception as e:
-                logger.error(f"Failed to merge PR: {e}")
-                if provider:
-                    await provider.set_working_indicator(task_id, "❌ Merge failed")
-                    await provider.post_comment(
-                        task_id,
-                        f"🤖 **Claudear**: Failed to merge PR #{task.pr_number}.\n\n"
-                        f"**Error**: {e}\n\n"
-                        f"Please merge manually: {task.pr_url}",
-                    )
-
-        await self.store.update_state(
-            task_id.provider,
-            task_id.instance_id,
-            task_id.external_id,
-            TaskState.DONE,
-        )
-
-    async def _handle_error(self, task_id: TaskId, error: str) -> None:
-        """Handle a task error.
-
-        Args:
-            task_id: Task identifier
-            error: Error message
-        """
-        composite_key = task_id.composite_key
-        logger.error(f"Task {task_id.identifier} failed: {error}")
+    async def _handle_error(
+        self,
+        task_id: TaskId,
+        error: str,
+        repo_key: str = "",
+        phase: str = "",
+    ) -> None:
+        """Handle a task error."""
+        task_key = f"{task_id.composite_key}:{repo_key}:{phase}"
+        logger.error(f"Task {task_id.identifier}/{repo_key}/{phase} failed: {error}")
 
         async with self._get_lock():
-            active_task = self._active_tasks.get(composite_key)
+            active_task = self._active_tasks.get(task_key)
             if active_task:
                 active_task.context.state_machine.fail(error)
-                del self._active_tasks[composite_key]
+                del self._active_tasks[task_key]
 
-        await self.store.update_state(
-            task_id.provider,
-            task_id.instance_id,
-            task_id.external_id,
-            TaskState.FAILED,
-            error,
-        )
+        await self.store.update_state(task_key, TaskState.FAILED, error)
 
         provider = self._get_provider(task_id)
         if provider:
             await provider.clear_indicators(task_id)
             await provider.post_comment(
                 task_id,
-                f"🤖 **Claudear**: Task failed\n\n**Error**: {error}\n\n"
+                f"**Claudear**: Task failed (repo: {repo_key})\n\n"
+                f"**Error**: {error}\n\n"
                 f"Please investigate and retry.",
             )
 
@@ -773,30 +747,20 @@ class TaskOrchestrator:
                     if not task.blocked_at:
                         continue
 
-                    # Check for timeout
                     blocked_duration = (
                         datetime.now() - task.blocked_at
                     ).total_seconds()
                     if blocked_duration > self._blocked_timeout:
-                        task_id = TaskId(
-                            provider=task.provider,
-                            instance_id=task.instance_id,
-                            external_id=task.external_id,
-                            identifier=task.task_identifier,
-                        )
+                        task_id = task.task_id
                         await self._handle_error(
                             task_id,
                             f"Blocked for {blocked_duration/3600:.1f} hours without response",
+                            repo_key=task.repo_key,
+                            phase=task.phase,
                         )
                         continue
 
-                    # Check for new comments via provider
-                    task_id = TaskId(
-                        provider=task.provider,
-                        instance_id=task.instance_id,
-                        external_id=task.external_id,
-                        identifier=task.task_identifier,
-                    )
+                    task_id = task.task_id
                     provider = self._get_provider(task_id)
                     if provider:
                         comments = await provider.get_new_comments(
@@ -804,7 +768,10 @@ class TaskOrchestrator:
                         )
                         if comments:
                             latest = max(comments, key=lambda c: c["created_at"])
-                            await self._handle_unblock(task_id, latest["body"])
+                            await self._handle_unblock(
+                                task_id, latest["body"],
+                                task_key=task.task_key,
+                            )
 
             except asyncio.CancelledError:
                 break
@@ -816,88 +783,49 @@ class TaskOrchestrator:
         active_tasks = await self.store.get_active_tasks()
 
         for task in active_tasks:
-            task_id = TaskId(
-                provider=task.provider,
-                instance_id=task.instance_id,
-                external_id=task.external_id,
-                identifier=task.task_identifier,
-            )
+            task_id = task.task_id
             provider = self._get_provider(task_id)
 
             if task.state == TaskState.IN_PROGRESS:
                 logger.warning(
-                    f"Task {task.task_identifier} was in progress, marking as failed"
+                    f"Task {task.task_identifier}/{task.repo_key}/{task.phase} "
+                    f"was in progress, marking as failed"
                 )
                 await self.store.update_state(
-                    task.provider,
-                    task.instance_id,
-                    task.external_id,
+                    task.task_key,
                     TaskState.FAILED,
                     "System restart - please retry",
                 )
                 if provider:
                     await provider.post_comment(
                         task_id,
-                        "🤖 **Claudear**: System restarted while task was in progress. "
-                        "Please move back to 'Todo' to retry.",
+                        f"**Claudear**: System restarted while task was in progress "
+                        f"(repo: {task.repo_key}). "
+                        "Please move back to trigger state to retry.",
                     )
 
             elif task.state == TaskState.BLOCKED:
                 logger.info(
-                    f"Task {task.task_identifier} still blocked, will poll for response"
+                    f"Task {task.task_identifier}/{task.repo_key} "
+                    f"still blocked, will poll for response"
                 )
 
     # -------------------------------------------------------------------------
     # Helpers
     # -------------------------------------------------------------------------
 
-    async def _save_task(self, task_id: TaskId, context: TaskContext) -> None:
-        """Save task context to store.
-
-        Args:
-            task_id: Task identifier
-            context: Task context to save
-        """
-        record = TaskRecord(
-            provider=task_id.provider,
-            instance_id=task_id.instance_id,
-            external_id=task_id.external_id,
-            task_identifier=task_id.identifier,
-            title=context.title,
-            description=context.description,
-            branch_name=context.branch_name or "",
-            worktree_path=context.worktree_path or "",
-            state=context.state,
-            blocked_reason=context.state_machine.blocked_reason,
-            blocked_at=context.state_machine.blocked_at,
-            pr_number=context.pr_number,
-            pr_url=context.pr_url,
-            session_id=context.session_id,
-            created_at=context.created_at,
-            updated_at=datetime.now(),
-        )
-        await self.store.save(record)
-
     def get_active_tasks(self) -> list[ActiveTask]:
-        """Get all active tasks.
-
-        Returns:
-            List of active tasks
-        """
+        """Get all active tasks."""
         return list(self._active_tasks.values())
 
     def get_instance_info(self) -> list[dict[str, Any]]:
-        """Get information about registered instances.
-
-        Returns:
-            List of instance info dicts
-        """
+        """Get information about registered instances."""
         return [
             {
                 "provider": key[0].value,
                 "instance_id": key[1],
                 "display_name": resources.instance.display_name,
-                "repo_path": str(resources.instance.repo_path),
+                "repo_path": str(resources.instance.repo_path) if resources.instance.repo_path else None,
             }
             for key, resources in self._instance_resources.items()
         ]

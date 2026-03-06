@@ -95,11 +95,33 @@ class WorktreeManager:
         sanitized = sanitized.strip("-")
         return sanitized.lower()
 
+    def get_branch_name(
+        self,
+        identifier: str,
+        repo_key: Optional[str] = None,
+        phase: Optional[str] = None,
+    ) -> str:
+        """Generate a branch name for a task.
+
+        Args:
+            identifier: Issue identifier (e.g., "ENG-123")
+            repo_key: Repository key (e.g., "api")
+            phase: Pipeline phase (e.g., "spec")
+
+        Returns:
+            Branch name like "eng-123/api/spec" or "claudear/eng-123"
+        """
+        safe_id = self._sanitize_name(identifier)
+        if repo_key and phase:
+            return f"{safe_id}/{repo_key}/{phase}"
+        return f"claudear/{safe_id}"
+
     async def create(
         self,
         issue_identifier: str,
         base_branch: str = "main",
         setup_command: Optional[str] = None,
+        branch_name: Optional[str] = None,
     ) -> Path:
         """Create a new worktree for an issue.
 
@@ -107,6 +129,7 @@ class WorktreeManager:
             issue_identifier: Issue identifier (e.g., "ENG-123")
             base_branch: Base branch to create from (default: "main")
             setup_command: Optional command to run after creation (e.g., "npm install")
+            branch_name: Custom branch name. If not provided, generates from identifier.
 
         Returns:
             Path to the created worktree
@@ -115,7 +138,7 @@ class WorktreeManager:
             WorktreeError: If worktree creation fails
         """
         safe_name = self._sanitize_name(issue_identifier)
-        branch_name = f"claudear/{safe_name}"
+        branch_name = branch_name or f"claudear/{safe_name}"
         worktree_path = self.worktrees_dir / safe_name
 
         # Check if worktree already exists
@@ -320,14 +343,3 @@ class WorktreeManager:
         await self._run_git("worktree", "prune")
         logger.info("Pruned stale worktree entries")
 
-    def get_branch_name(self, issue_identifier: str) -> str:
-        """Get the branch name for an issue.
-
-        Args:
-            issue_identifier: Issue identifier
-
-        Returns:
-            Branch name
-        """
-        safe_name = self._sanitize_name(issue_identifier)
-        return f"claudear/{safe_name}"

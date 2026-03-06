@@ -53,15 +53,28 @@ class LinearProvider(PMProvider):
     avoiding the need for per-team state name configuration.
     """
 
-    def __init__(self, api_key: str, labels_enabled: bool = True):
+    def __init__(
+        self,
+        api_key: str,
+        labels_enabled: bool = True,
+        allowed_assignees: Optional[list[str]] = None,
+        valid_repo_keys: Optional[list[str]] = None,
+        phase_config: Optional[dict[str, dict[str, str]]] = None,
+    ):
         """Initialize the Linear provider.
 
         Args:
             api_key: Linear API key
             labels_enabled: Whether to use Claudear labels
+            allowed_assignees: User IDs allowed to trigger automation
+            valid_repo_keys: Valid repo keys from REPO_MAP
+            phase_config: Phase trigger configuration
         """
         self._api_key = api_key
         self._labels_enabled = labels_enabled
+        self._allowed_assignees = allowed_assignees or []
+        self._valid_repo_keys = valid_repo_keys or []
+        self._phase_config = phase_config or {}
 
         # Shared client (works across all teams with same API key)
         self._client = LinearClient(api_key)
@@ -255,6 +268,35 @@ class LinearProvider(PMProvider):
             task_id.external_id, target_state_name, team_uuid
         )
 
+    async def update_task_status_by_name(
+        self, task_id: TaskId, state_name: str
+    ) -> bool:
+        """Update task status using an exact state name.
+
+        Resolves the state name to a state ID for the team and sets it.
+
+        Args:
+            task_id: Task to update
+            state_name: Exact state name (e.g. "Spec Review", "In Review")
+
+        Returns:
+            True if updated successfully
+        """
+        team_id = task_id.instance_id
+        team_uuid = await self._client.get_team_uuid(team_id)
+        states = await self._client.get_workflow_states(team_uuid)
+
+        if state_name not in states:
+            logger.warning(
+                f"State '{state_name}' not found in team {team_id}. "
+                f"Available: {list(states.keys())}"
+            )
+            return False
+
+        return await self._client.update_issue_state(
+            task_id.external_id, state_name, team_uuid
+        )
+
     # -------------------------------------------------------------------------
     # Comments
     # -------------------------------------------------------------------------
@@ -382,7 +424,11 @@ class LinearProvider(PMProvider):
         if team_id not in self._event_sources:
             from claudear.providers.linear.webhook import LinearWebhookEventSource
             self._event_sources[team_id] = LinearWebhookEventSource(
-                self, instance
+                provider=self,
+                instance=instance,
+                allowed_assignees=self._allowed_assignees,
+                valid_repo_keys=self._valid_repo_keys,
+                phase_config=self._phase_config,
             )
         return self._event_sources[team_id]
 

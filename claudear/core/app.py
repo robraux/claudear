@@ -75,7 +75,7 @@ def print_banner(
     settings: MultiProviderSettings,
     public_url: Optional[str] = None,
 ):
-    """Print startup banner with multi-provider info."""
+    """Print startup banner."""
     PURPLE = "\033[38;5;141m"
     BLUE = "\033[38;5;75m"
     GREEN = "\033[38;5;114m"
@@ -92,54 +92,43 @@ def print_banner(
 ║ ╚██████╗███████╗██║  ██║╚██████╔╝██████╔╝███████╗██║  ██║██║  ██║  ║
 ║  ╚═════╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝  ║
 ║                                                                    ║
-║  Multi-Provider Autonomous Development Automation for Claude Code  ║
+║  Autonomous Development Automation for Claude Code                ║
 ║                                                                    ║
 ╚════════════════════════════════════════════════════════════════════╝{RESET}
 """
     print(banner)
 
     # Print provider info
-    print(f"{BLUE}📋 Active Providers:{RESET}")
+    print(f"{BLUE}Active Providers:{RESET}")
 
     if settings.has_linear():
         teams = settings.get_linear_team_ids()
-        print(f"   {GREEN}✓ Linear{RESET}")
+        print(f"   {GREEN}Linear{RESET}")
         for team_id in teams:
             instance = settings.get_linear_instance(team_id)
             if instance:
-                print(f"     • Team {team_id} → {instance.repo_path}")
-
-    if settings.has_notion():
-        databases = settings.get_notion_database_ids()
-        print(f"   {GREEN}✓ Notion{RESET}")
-        for db_id in databases:
-            instance = settings.get_notion_instance(db_id)
-            if instance:
-                short_id = db_id.replace("-", "")[:8]
-                print(f"     • Database {short_id} → {instance.repo_path}")
+                print(f"     - Team {team_id} -> {instance.repo_path}")
 
     print()
 
     # Print webhook info
     if settings.has_linear():
         if public_url:
-            print(f"{YELLOW}📡 Linear Webhook:{RESET} {public_url}/webhooks/linear")
+            print(f"{YELLOW}Linear Webhook:{RESET} {public_url}/webhooks/linear")
         else:
             print(
-                f"{YELLOW}📡 Linear Webhook:{RESET} http://localhost:{settings.webhook_port}/webhooks/linear"
+                f"{YELLOW}Linear Webhook:{RESET} http://localhost:{settings.webhook_port}/webhooks/linear"
             )
 
     print()
-    print(f"{BLUE}⚙️  Settings:{RESET}")
+    print(f"{BLUE}Settings:{RESET}")
     print(f"   Max concurrent tasks: {settings.max_concurrent_tasks}")
     print(f"   Comment poll interval: {settings.comment_poll_interval}s")
-    if settings.has_notion():
-        print(f"   Notion poll interval: {settings.notion_poll_interval}s")
     print()
 
 
 class ClaudearApp:
-    """Multi-provider Claudear application."""
+    """Claudear application."""
 
     def __init__(self):
         """Initialize the application."""
@@ -147,12 +136,32 @@ class ClaudearApp:
         self.orchestrator: Optional[TaskOrchestrator] = None
         self._providers: dict[ProviderType, PMProvider] = {}
 
+    def _build_phase_config(self) -> dict[str, dict[str, str]]:
+        """Build phase trigger configuration from settings."""
+        settings = self.settings
+        return {
+            settings.phase1_trigger_state: {
+                "phase": "spec",
+                "command": settings.phase1_command,
+                "active_state": settings.phase1_active_state,
+                "complete_state": settings.phase1_complete_state,
+                "blocked_state": settings.blocked_state,
+            },
+            settings.phase2_trigger_state: {
+                "phase": "implement",
+                "command": settings.phase2_command,
+                "active_state": settings.phase2_active_state,
+                "complete_state": settings.phase2_complete_state,
+                "blocked_state": settings.blocked_state,
+            },
+        }
+
     async def initialize(self) -> None:
         """Initialize all providers and the orchestrator."""
         settings = self.settings
 
         # Validate configuration
-        errors = settings.validate()
+        errors = settings.validate_config()
         if errors:
             logger.error("Configuration errors:")
             for error in errors:
@@ -162,6 +171,9 @@ class ClaudearApp:
         # Create task store
         store = TaskStore(settings.db_path)
 
+        # Build phase config
+        phase_config = self._build_phase_config()
+
         # Create orchestrator
         self.orchestrator = TaskOrchestrator(
             task_store=store,
@@ -169,15 +181,13 @@ class ClaudearApp:
             max_concurrent_tasks=settings.max_concurrent_tasks,
             comment_poll_interval=settings.comment_poll_interval,
             blocked_timeout=settings.blocked_timeout,
+            repo_map=settings.get_repo_map(),
+            phase_config=phase_config,
         )
 
         # Initialize Linear provider if configured
         if settings.has_linear():
             await self._init_linear()
-
-        # Initialize Notion provider if configured
-        if settings.has_notion():
-            await self._init_notion()
 
         logger.info("Application initialized")
 
@@ -187,9 +197,16 @@ class ClaudearApp:
 
         from claudear.providers.linear import LinearProvider
 
+        allowed_assignees = settings.get_allowed_assignees()
+        valid_repo_keys = list(settings.get_repo_map().keys())
+        phase_config = self._build_phase_config()
+
         provider = LinearProvider(
             api_key=settings.linear_api_key,
             labels_enabled=settings.linear_labels_enabled,
+            allowed_assignees=allowed_assignees,
+            valid_repo_keys=valid_repo_keys,
+            phase_config=phase_config,
         )
         await provider.initialize()
 
@@ -204,28 +221,6 @@ class ClaudearApp:
 
         logger.info(
             f"Linear provider initialized with {len(settings.get_linear_team_ids())} team(s)"
-        )
-
-    async def _init_notion(self) -> None:
-        """Initialize Notion provider and databases."""
-        settings = self.settings
-
-        from claudear.providers.notion import NotionProvider
-
-        provider = NotionProvider(api_key=settings.notion_api_key)
-        await provider.initialize()
-
-        self._providers[ProviderType.NOTION] = provider
-        self.orchestrator.register_provider(provider)
-
-        # Register each database
-        for db_id in settings.get_notion_database_ids():
-            instance = settings.get_notion_instance(db_id)
-            if instance:
-                await self.orchestrator.register_instance(instance)
-
-        logger.info(
-            f"Notion provider initialized with {len(settings.get_notion_database_ids())} database(s)"
         )
 
     async def start(self) -> None:

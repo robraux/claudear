@@ -13,7 +13,6 @@ class ProviderType(Enum):
     """Supported project management providers."""
 
     LINEAR = "linear"
-    NOTION = "notion"
     # Future providers:
     # JIRA = "jira"
     # ASANA = "asana"

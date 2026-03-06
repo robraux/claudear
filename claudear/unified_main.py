@@ -35,7 +35,7 @@ def validate_config(settings: MultiProviderSettings) -> bool:
     Returns:
         True if valid, False otherwise
     """
-    errors = settings.validate()
+    errors = settings.validate_config()
 
     if errors:
         logger.error("Configuration errors:")

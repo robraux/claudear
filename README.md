@@ -46,7 +46,7 @@ claudear
 
 - Python 3.9+
 - [Claude Code](https://claude.ai/code) CLI installed and authenticated
-- [ngrok](https://ngrok.com/) account (free tier works) for webhook delivery
+- [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) or [ngrok](https://ngrok.com/) for webhook delivery
 - [GitHub CLI](https://cli.github.com/) (`gh`) installed and authenticated
 - Linear workspace with API access
 
@@ -82,9 +82,8 @@ PHASE2_COMMAND=implement-spec
 # GitHub
 GITHUB_TOKEN=ghp_xxx
 
-# Server & ngrok
-WEBHOOK_PORT=8000
-NGROK_AUTHTOKEN=xxx
+# Server
+WEBHOOK_PORT=8741
 
 # Optional
 LINEAR_LABELS_ENABLED=true           # Real-time activity labels (default: true)
@@ -114,10 +113,66 @@ Create these labels in your Linear workspace:
 
 ## Setup
 
-### 1. Create a static ngrok domain
+### 1. Set up a tunnel
 
-1. Go to [ngrok Domains](https://dashboard.ngrok.com/cloud-edge/domains)
-2. Create a free static domain (e.g., `your-name.ngrok-free.app`)
+Claudear's webhook server listens on `localhost:8741` (configurable via `WEBHOOK_PORT`). You need a public HTTPS URL that forwards to it so Linear can deliver webhooks.
+
+#### Option A: cloudflared (recommended)
+
+[cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/) creates a Cloudflare Tunnel with no open inbound ports.
+
+```bash
+# macOS
+brew install cloudflared
+
+# Linux (Debian/Ubuntu)
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+sudo dpkg -i cloudflared.deb
+```
+
+**Named tunnel (persistent hostname)** - gives you a stable URL like `claudear.yourdomain.com` that you register once in Linear:
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create claudear
+cloudflared tunnel route dns claudear claudear.yourdomain.com
+```
+
+Create `~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: claudear
+credentials-file: ~/.cloudflared/<TUNNEL_ID>.json
+
+ingress:
+  - hostname: claudear.yourdomain.com
+    service: http://localhost:8741
+  - service: http_status:404
+```
+
+```bash
+cloudflared tunnel run claudear
+```
+
+**Quick tunnel** - for testing, no Cloudflare account needed (URL changes on each restart):
+
+```bash
+cloudflared tunnel --url http://localhost:8741
+```
+
+#### Option B: ngrok
+
+[ngrok](https://ngrok.com/) also works. Claudear has built-in ngrok support via `pyngrok` - just set `NGROK_AUTHTOKEN` in your `.env` and the tunnel starts automatically with the server.
+
+```bash
+NGROK_AUTHTOKEN=xxx
+```
+
+Or run ngrok manually:
+
+```bash
+ngrok http 8741
+```
 
 ### 2. Disable Linear's GitHub automations
 
@@ -129,7 +184,7 @@ Linear has built-in automations that conflict with Claudear. **You must disable 
 ### 3. Register Linear webhook
 
 1. Linear -> Settings -> API -> Webhooks -> **Create webhook**
-2. URL: `https://your-name.ngrok-free.app/webhooks/linear`
+2. URL: `https://claudear.yourdomain.com/webhooks/linear` (or your quick tunnel URL)
 3. Events: Issues, Comments
 4. Copy the signing secret to `LINEAR_WEBHOOK_SECRET`
 
@@ -142,9 +197,9 @@ claudear
 ## Troubleshooting
 
 **Webhook not receiving events**
-- Verify webhook URL matches your ngrok domain
+- Verify `cloudflared` is running and the tunnel URL matches what you registered in Linear
 - Check signing secret matches `LINEAR_WEBHOOK_SECRET`
-- Test: `curl https://your-domain.ngrok-free.app/health`
+- Test: `curl https://claudear.yourdomain.com/health`
 
 **Issues not picked up**
 - Verify the issue has the `claude:auto` label

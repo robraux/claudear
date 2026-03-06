@@ -90,7 +90,7 @@ class MultiProviderSettings(BaseSettings):
     github_token: Optional[str] = None
 
     # Server
-    webhook_port: int = 8000
+    webhook_port: int = 8741
     webhook_host: str = "0.0.0.0"
     ngrok_authtoken: Optional[str] = None
 
